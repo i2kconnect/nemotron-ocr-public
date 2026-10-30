@@ -1,77 +1,149 @@
-# Public NVIDIA Nemotron OCR v2 on Nostromo
+# Nemotron OCR v2 HTTP service
 
-This standalone service runs NVIDIA's published OCR pipeline on the RTX 4090
-(24 GiB). It uses the public PyTorch image and Hugging Face model; an NVIDIA
-enterprise subscription and NGC key are unnecessary. Upstream code and English
-weights are pinned to revision `0e83e83f17943524b90afa6c0fd82ac2bc1a40ca`.
-The CUDA extension is compiled for Ada compute capability 8.9.
+A small HTTP adapter for [NVIDIA Nemotron OCR v2](https://huggingface.co/nvidia/nemotron-ocr-v2).
+It runs the upstream Python OCR pipeline on an NVIDIA GPU and exposes raw text
+detections through a subset of the NIM 2.x OCR API. Clients can use the results
+for their own document layout, paragraph, and table reconstruction.
 
-`server.py` only translates images and raw detections into the NIM 2.x wire
-format. It does not reconstruct document flow, paragraphs, or tables and does
-not import code from `nemotron-ocr-spark`. i2klib owns that processing in Java
-and produces its existing canonical i2k Markdown v2 output.
+The image installs NVIDIA's Python implementation and downloads English model
+weights from Hugging Face. Both are pinned to revision
+`0e83e83f17943524b90afa6c0fd82ac2bc1a40ca`.
+
+## Requirements
+
+- Docker and NVIDIA Container Toolkit with CDI configured. The helper script
+  selects the device `nvidia.com/gpu=0`.
+- An NVIDIA GPU supported by the upstream model and the container's CUDA/PyTorch
+  stack, with sufficient device memory for inference.
+- A host NVIDIA driver compatible with the `nvcr.io/nvidia/pytorch:25.11-py3`
+  base image.
+- Network access to obtain the container image, Python dependencies, upstream
+  source, and model weights. Subsequent starts reuse cached weights.
+
+## Build
+
+```bash
+git clone https://github.com/i2kconnect/nemotron-ocr-public.git
+cd nemotron-ocr-public
+```
+
+The upstream CUDA extension must be compiled for the target GPU's compute
+capability. The Dockerfile defaults to `8.9`; select a different target with
+the `TORCH_CUDA_ARCH_LIST` build argument:
+
+```bash
+docker build \
+  --build-arg TORCH_CUDA_ARCH_LIST="<compute-capability>" \
+  -t nemotron-ocr-upstream:public-v2 .
+```
+
+Replace `<compute-capability>` with the target GPU's value. Multiple targets
+can be supplied as a quoted, semicolon-separated list, provided the container's
+CUDA toolchain supports them. For the default target, use `./run.sh build`.
+Selecting a build target alone does not establish model compatibility or memory
+requirements for a particular GPU.
 
 ## Run
 
-Docker and the NVIDIA Container Toolkit's CDI device must already work:
-
 ```bash
-cd /home/josh/i2k/projects/nemotron-ocr-public
-./run.sh build
 ./run.sh start
 ./run.sh status
 ./run.sh logs
 ./run.sh stop
 ```
 
-The default listener is `127.0.0.1:8080`. `PORT` overrides the host port;
-`OCR_CACHE` overrides the default `cache/` directory. The model cache is mounted
-writable for the invoking user. First startup downloads pinned English weights
-from Hugging Face; later starts reuse them. Nostromo's existing downloaded
-weights were copied into this independent cache during migration.
+The service listens at `http://127.0.0.1:8080`. The helper creates a container
+named `nemotron-ocr-upstream`, runs it as the invoking user with 2 GiB of shared
+memory, and mounts a writable model cache. First startup downloads the weights
+and initializes the model; wait for readiness before sending OCR requests.
 
-The script creates container `nemotron-ocr-upstream`. To recreate it after an
-image or port change, stop and remove that container, then run `start` again.
-The container runs as the invoking user with one GPU and 2 GiB shared memory.
-English recognition uses upstream detector length 1536; inference is serialized.
+| Setting | Default | Purpose |
+| --- | --- | --- |
+| `PORT` | `8080` | Host port, bound to loopback |
+| `OCR_CACHE` | `cache/` inside the checkout | Host directory for downloaded weights |
+
+For example:
+
+```bash
+PORT=8090 OCR_CACHE=/absolute/path/to/model-cache ./run.sh start
+PORT=8090 ./run.sh status
+```
+
+The helper's `start` command creates a new container. After stopping it, remove
+the existing container before starting again or changing its image or settings:
+
+```bash
+./run.sh stop
+docker rm nemotron-ocr-upstream
+./run.sh start
+```
+
+The bind-mounted model cache remains available after container removal. The
+shipped configuration loads English weights, uses detector length `1536`, and
+serializes inference. Other languages require corresponding model downloads
+and server configuration; changing a language environment variable alone is
+insufficient.
 
 ## API
 
-- `GET /v1/health/ready`: returns readiness after model initialization.
-- `POST /v1/ocr`: JSON `input` array with objects containing
-  `type: "image_url"` and `url: "data:image/png;base64,..."` (JPEG also accepted).
-  `merge_levels: ["word"]` requests raw words.
-- Responses contain `data[].index` and `data[].text_detections[]` with normalized
-  four-point `bounding_box.points` and `text_prediction.text/confidence`.
-
-This adapter implements the subset used by i2klib, rather than a full NIM
-replacement: data URLs only, one merge level per request, up to 16 images,
-32 MiB request bodies, and 8 million pixels per raster. i2klib tiles larger
-images. Upstream provides axis-aligned bounds; the adapter preserves this
-geometry and uses confidence 0.5 when upstream supplies no confidence.
-
-## Java integration and verification
-
-Build i2klib core and the existing `i2klib-ocr-nemotron` add-on with Java 17.
-Use `new NemotronOcrEngine(URI.create("http://127.0.0.1:8080"))` and existing
-`ParserOptions.withOcrFallback(engine)`. See the component's `OCR_ADDONS.md`.
+### Readiness
 
 ```bash
-cd /home/josh/i2k/i2ksuite/i2klib
-export JAVA_CMD=/usr/lib/jvm/java-17-openjdk/bin/java
-export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
-mvn -f addons/ocr-nemotron/pom.xml \
-  -Dnemotron.url=http://127.0.0.1:8080 \
-  -Dnemotron.output=/tmp/nemotron-java-verification test
+curl --fail http://127.0.0.1:8080/v1/health/ready
 ```
 
-The live test verifies synthetic images and scanned PDFs, reconstructed tables,
-canonical Markdown round trips, and sideways recognition. This is an integration
-check, not an accuracy benchmark on the production corpus.
+### Recognize an image
 
-The former `nemotron-ocr-public` container was stopped and retained for rollback.
-To roll back, stop this service and start that retained container. Do not run
-both on port 8080. The Eric checkout remains available for comparison.
+Send `POST /v1/ocr` with a base64 PNG or JPEG data URL:
 
-Upstream implementation: Apache-2.0. Model weights: NVIDIA Open Model License
-Agreement. The base image carries its published NVIDIA container terms.
+```json
+{
+  "input": [
+    {"type": "image_url", "url": "data:image/png;base64,<base64-image-bytes>"}
+  ],
+  "merge_levels": ["word"]
+}
+```
+
+For example, using Python's standard library to create the request:
+
+```bash
+python3 - <<'PY' > request.json
+import base64
+import json
+from pathlib import Path
+
+encoded = base64.b64encode(Path("document.png").read_bytes()).decode("ascii")
+print(json.dumps({
+    "input": [{"type": "image_url", "url": "data:image/png;base64," + encoded}],
+    "merge_levels": ["word"],
+}))
+PY
+curl --fail-with-body http://127.0.0.1:8080/v1/ocr \
+  -H 'Content-Type: application/json' \
+  --data-binary @request.json
+```
+
+Responses contain `data[].index` and `data[].text_detections[]`. Each detection
+includes a normalized four-point `bounding_box.points` polygon and
+`text_prediction.text` and `text_prediction.confidence` fields.
+
+The adapter supports:
+
+- PNG and JPEG data URLs; remote image URLs and direct PDF input are unsupported.
+- One merge level per request: `word` (default), `sentence`, or `paragraph`.
+- Between 1 and 16 images per request.
+- A maximum JSON request body of 32 MiB and 8 million pixels per image.
+
+Clients must rasterize PDFs and tile larger images before submitting them.
+The adapter preserves upstream axis-aligned bounds and uses confidence `0.5`
+when upstream supplies no confidence. It does not reconstruct reading order,
+tables, or formatted documents and does not implement the complete NIM API.
+
+## Licensing
+
+The upstream implementation is Apache-2.0 licensed. Model weights use the
+NVIDIA Open Model License Agreement. See the
+[upstream repository](https://huggingface.co/nvidia/nemotron-ocr-v2) for its
+license files and model terms. The base image is subject to its published
+NVIDIA container terms.

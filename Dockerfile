@@ -1,7 +1,8 @@
 FROM nvcr.io/nvidia/pytorch:25.11-py3
 ARG NEMOTRON_REVISION=0e83e83f17943524b90afa6c0fd82ac2bc1a40ca
 ENV NEMOTRON_REVISION=${NEMOTRON_REVISION}
-ENV TORCH_CUDA_ARCH_LIST=8.9 FORCE_CUDA=1 MAX_JOBS=4
+ARG TORCH_CUDA_ARCH_LIST=8.9
+ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} FORCE_CUDA=1 MAX_JOBS=4
 RUN apt-get update && apt-get install -y --no-install-recommends git ninja-build && rm -rf /var/lib/apt/lists/*
 RUN python -m pip install --no-cache-dir setuptools wheel ninja pybind11 hatchling fastapi uvicorn pillow
 RUN GIT_LFS_SKIP_SMUDGE=1 git clone https://huggingface.co/nvidia/nemotron-ocr-v2 /opt/nemotron \
